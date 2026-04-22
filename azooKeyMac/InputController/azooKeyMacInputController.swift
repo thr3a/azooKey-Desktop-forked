@@ -8,6 +8,14 @@ class azooKeyMacInputController: IMKInputController, NSMenuItemValidation { // s
     var segmentsManager: SegmentsManager
     private(set) var inputState: InputState = .none
     private var inputLanguage: InputLanguage = .japanese
+    // Shift+A..Z で開始される、現在の composition に英字を直接混ぜ書きするモード (Google IME 風)
+    // 有効中は以降の入力がローマ字変換されず .direct スタイルで preedit に追加される。
+    // Enter/Space/確定時の inputState→.none 遷移で自動解除。
+    private var capitalMixModeActive: Bool = false
+    // トリガー直後の composition 長 (英字区間より手前のかな部分の長さ)。
+    // backspace でこの長さまで戻ったら混ぜ書きモードを解除する。
+    // -1 はトリガー直後 (まだ未測定) を表すセンチネル。
+    private var capitalMixModeBaseLength: Int = -1
     var liveConversionEnabled: Bool {
         Config.LiveConversion().value
     }
@@ -291,6 +299,30 @@ class azooKeyMacInputController: IMKInputController, NSMenuItemValidation { // s
 
         let userAction = UserAction.getUserAction(eventCore: event.keyEventCore, inputLanguage: inputLanguage)
 
+        // Shift+A..Z が押されたら現在の composition に英字を混ぜ書きするモードに入る (Google IME 風)
+        // これ以降の入力は .direct で preedit に追加される (ローマ字変換されない)
+        if self.inputLanguage == .japanese,
+           !self.capitalMixModeActive,
+           Self.isCapitalShiftTrigger(event: event),
+           self.canEnterCapitalMixMode() {
+            self.capitalMixModeActive = true
+            // トリガー直後の composition 長は handleClientAction 後に計測する
+            self.capitalMixModeBaseLength = -1
+        }
+        // 混ぜ書きモード中は Space で確定する (候補プレビューを出さない)
+        if self.capitalMixModeActive, case .space = userAction {
+            if !self.segmentsManager.isEmpty {
+                let text = self.segmentsManager.commitMarkedText(inputState: self.inputState)
+                client.insertText(text, replacementRange: NSRange(location: NSNotFound, length: 0))
+            }
+            self.capitalMixModeActive = false
+            self.inputState = .none
+            self.refreshMarkedText()
+            self.refreshCandidateWindow()
+            self.refreshPredictionWindow()
+            return true
+        }
+
         // 英数キー（keyCode 102）の処理
         if event.keyCode == 102 {
             let isDoubleTap = checkAndUpdateDoubleTap(keyCode: 102)
@@ -362,6 +394,34 @@ class azooKeyMacInputController: IMKInputController, NSMenuItemValidation { // s
         return handleClientAction(clientAction, clientActionCallback: clientActionCallback, client: client)
     }
 
+    // MARK: - 大文字混ぜ書きモード (Google IME 風)
+    // 日本語入力中に Shift+A..Z が押されたら、現在の composition を維持したまま以降の入力を
+    // 直接英字として preedit に追加するモード。Enter/Space で composition ごと確定する。
+
+    private static func isCapitalShiftTrigger(event: NSEvent) -> Bool {
+        guard let chars = event.characters, chars.count == 1 else {
+            return false
+        }
+        guard let scalar = chars.unicodeScalars.first, (0x41...0x5A).contains(scalar.value) else {
+            return false
+        }
+        let mods = event.modifierFlags
+        if mods.contains(.command) || mods.contains(.control) || mods.contains(.option) {
+            return false
+        }
+        // Shift キー押下が必要 (Caps Lock 単独では反応させない)
+        return mods.contains(.shift)
+    }
+
+    private func canEnterCapitalMixMode() -> Bool {
+        switch self.inputState {
+        case .none, .composing, .previewing, .selecting:
+            return true
+        default:
+            return false
+        }
+    }
+
     private var inputStyle: InputStyle {
         switch Config.InputStyle().value {
         case .default:
@@ -397,12 +457,12 @@ class azooKeyMacInputController: IMKInputController, NSMenuItemValidation { // s
             self.segmentsManager.insertCompositionSeparator(inputStyle: self.inputStyle, skipUpdate: true)
             self.segmentsManager.update(requestRichCandidates: true)
         case .appendToMarkedText(let string):
-            // 英語モードの場合は.directでローマ字変換せずそのまま入力
-            let inputStyle: InputStyle = self.inputLanguage == .english ? .direct : self.inputStyle
+            // 英語モード、または大文字混ぜ書きモード中は .direct でローマ字変換せずそのまま入力
+            let inputStyle: InputStyle = (self.inputLanguage == .english || self.capitalMixModeActive) ? .direct : self.inputStyle
             self.segmentsManager.insertAtCursorPosition(string, inputStyle: inputStyle)
         case .appendPieceToMarkedText(let pieces):
-            // 英語モードの場合は.directでローマ字変換せずそのまま入力
-            let inputStyle: InputStyle = self.inputLanguage == .english ? .direct : self.inputStyle
+            // 英語モード、または大文字混ぜ書きモード中は .direct でローマ字変換せずそのまま入力
+            let inputStyle: InputStyle = (self.inputLanguage == .english || self.capitalMixModeActive) ? .direct : self.inputStyle
             self.segmentsManager.insertAtCursorPosition(pieces: pieces, inputStyle: inputStyle)
         case .insertWithoutMarkedText(let string):
             client.insertText(string, replacementRange: NSRange(location: NSNotFound, length: 0))
@@ -414,14 +474,14 @@ class azooKeyMacInputController: IMKInputController, NSMenuItemValidation { // s
         case .commitMarkedTextAndAppendToMarkedText(let string):
             let text = self.segmentsManager.commitMarkedText(inputState: self.inputState)
             client.insertText(text, replacementRange: NSRange(location: NSNotFound, length: 0))
-            // 英語モードの場合は.directでローマ字変換せずそのまま入力
-            let inputStyle: InputStyle = self.inputLanguage == .english ? .direct : self.inputStyle
+            // 英語モード、または大文字混ぜ書きモード中は .direct でローマ字変換せずそのまま入力
+            let inputStyle: InputStyle = (self.inputLanguage == .english || self.capitalMixModeActive) ? .direct : self.inputStyle
             self.segmentsManager.insertAtCursorPosition(string, inputStyle: inputStyle)
         case .commitMarkedTextAndAppendPieceToMarkedText(let pieces):
             let text = self.segmentsManager.commitMarkedText(inputState: self.inputState)
             client.insertText(text, replacementRange: NSRange(location: NSNotFound, length: 0))
-            // 英語モードの場合は.directでローマ字変換せずそのまま入力
-            let inputStyle: InputStyle = self.inputLanguage == .english ? .direct : self.inputStyle
+            // 英語モード、または大文字混ぜ書きモード中は .direct でローマ字変換せずそのまま入力
+            let inputStyle: InputStyle = (self.inputLanguage == .english || self.capitalMixModeActive) ? .direct : self.inputStyle
             self.segmentsManager.insertAtCursorPosition(pieces: pieces, inputStyle: inputStyle)
         case .submitSelectedCandidate:
             self.submitSelectedCandidate()
@@ -540,11 +600,29 @@ class azooKeyMacInputController: IMKInputController, NSMenuItemValidation { // s
                 self.replaceSuggestionWindow.orderOut(nil)
             }
             if inputState == .none {
+                // composition が終わったら混ぜ書きモードも解除
+                self.capitalMixModeActive = false
                 self.switchInputLanguage(self.inputLanguage, client: client)
             }
             self.inputState = inputState
         case .basedOnBackspace(let ifIsEmpty, let ifIsNotEmpty), .basedOnSubmitCandidate(let ifIsEmpty, let ifIsNotEmpty):
             self.inputState = self.segmentsManager.isEmpty ? ifIsEmpty : ifIsNotEmpty
+            if self.inputState == .none {
+                self.capitalMixModeActive = false
+            }
+        }
+
+        // 混ぜ書きモード: トリガー直後なら基準長を測定、それ以降は backspace で
+        // 英字区間を消し切ったら解除する (.previewing/.selecting からの遷移で
+        // composition が一旦縮むケースに対応するため事後測定する)。
+        if self.capitalMixModeActive {
+            let currentLength = self.segmentsManager.convertTarget.count
+            if self.capitalMixModeBaseLength < 0 {
+                // トリガー直後: 現在の長さから英字 1 文字分を引いた値を基準長とする
+                self.capitalMixModeBaseLength = max(0, currentLength - 1)
+            } else if currentLength <= self.capitalMixModeBaseLength {
+                self.capitalMixModeActive = false
+            }
         }
 
         self.refreshMarkedText()
@@ -554,18 +632,27 @@ class azooKeyMacInputController: IMKInputController, NSMenuItemValidation { // s
     }
 
     @MainActor func switchInputLanguage(_ language: InputLanguage, client: IMKTextInput) {
+        // 明示的な言語切り替え時は大文字混ぜ書きモードも解除する
+        self.capitalMixModeActive = false
         self.inputLanguage = language
         client.overrideKeyboard(withKeyboardNamed: Config.KeyboardLayout().value.layoutIdentifier)
         switch language {
         case .english:
-            client.selectMode("dev.ensan.inputmethod.azooKeyMac.Roman")
+            client.selectMode("dev.uten2c.inputmethod.azooKeyMac.Roman")
             self.segmentsManager.stopJapaneseInput()
         case .japanese:
-            client.selectMode("dev.ensan.inputmethod.azooKeyMac.Japanese")
+            client.selectMode("dev.uten2c.inputmethod.azooKeyMac.Japanese")
         }
     }
 
     func refreshCandidateWindow() {
+        // 大文字混ぜ書きモード中は候補ウィンドウを出さない
+        if self.capitalMixModeActive {
+            self.candidatesWindow.setIsVisible(false)
+            self.candidatesWindow.orderOut(nil)
+            self.candidatesViewController.hide()
+            return
+        }
         switch self.segmentsManager.getCurrentCandidateWindow(inputState: self.inputState) {
         case .selecting(let candidates, let selectionIndex):
             var rect: NSRect = .zero
@@ -597,6 +684,11 @@ class azooKeyMacInputController: IMKInputController, NSMenuItemValidation { // s
     }
 
     func refreshPredictionWindow() {
+        // 大文字混ぜ書きモード中は予測ウィンドウを出さない
+        if self.capitalMixModeActive {
+            self.hidePredictionWindow()
+            return
+        }
         guard self.inputState == .composing else {
             self.hidePredictionWindow()
             return
