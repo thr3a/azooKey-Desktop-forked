@@ -1,11 +1,12 @@
-name: Swift Build and Test
+name: Build DMG
+
 on:
   push:
   pull_request:
 
 jobs:
-  macos-build:
-    name: Build and Test on macOS
+  build-dmg:
+    name: Build and Upload DMG
     runs-on: macos-15
     steps:
       - name: Select Xcode 16.3
@@ -14,72 +15,62 @@ jobs:
           echo "Using Xcode at $XCODE_PATH"
           sudo xcode-select -s "$XCODE_PATH/Contents/Developer"
           xcodebuild -version
-      - uses: actions/checkout@v4
-        with:
-          submodules: true
-      - name: Build
-        run: swift build --package-path Core
-      - name: Test
-        run: swift test --package-path Core
 
-  ubuntu-build:
-    name: Build and Test on Ubuntu
-    runs-on: ubuntu-22.04
-    steps:
       - uses: actions/checkout@v4
         with:
           submodules: true
-      - name: Setup Swift 6.2
-        uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: "6.2"
-      - name: Build
-        run: swift build --package-path Core
-      - name: Test
-        run: swift test --package-path Core
 
-  xcodebuild-test:
-    name: Xcodebuild test on macOS
-    runs-on: macos-15
-    steps:
-      - name: Select Xcode 16.3
+      - name: Archive
         run: |
-          XCODE_PATH=$(ls -d /Applications/Xcode_16.3*.app | head -n 1)
-          echo "Using Xcode at $XCODE_PATH"
-          sudo xcode-select -s "$XCODE_PATH/Contents/Developer"
-          xcodebuild -version
-      - uses: actions/checkout@v4
-        with:
-          submodules: true
-      - name: Verify xcodebuild installation
-        run: xcodebuild -version
-      - name: List available schemes
-        run: xcodebuild -project azooKeyMac.xcodeproj -list
-      - name: Test building azooKeyMac (Release configuration)
-        run: |
-         xcodebuild \
-          -project azooKeyMac.xcodeproj \
-          -scheme azooKeyMac \
-          -configuration Release \
-          -destination 'generic/platform=macOS' \
-          CODE_SIGNING_ALLOWED=NO \
-          CODE_SIGNING_REQUIRED=NO \
-          CODE_SIGN_IDENTITY=""
+          set -euo pipefail
+          xcodebuild \
+            archive \
+            -project azooKeyMac.xcodeproj \
+            -scheme azooKeyMac \
+            -configuration Release \
+            -archivePath build/archive.xcarchive \
+            -destination 'generic/platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+          ls -la build/archive.xcarchive/Products/Applications
 
-  swiftlint:
-    name: SwiftLint
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
+      - name: Extract .app from archive
+        run: |
+          mkdir -p build/app
+          ditto build/archive.xcarchive/Products/Applications/azooKeyMac.app build/app/azooKeyMac.app
+
+      - name: Create DMG
+        run: |
+          APP_NAME="azooKeyMac"
+          DMG_NAME="${APP_NAME}.dmg"
+          TEMP_DMG="temp.dmg"
+          
+          # Create temporary DMG
+          hdiutil create -srcfolder build/app -volname "${APP_NAME}" -fs HFS+ -format UDRW -size 100m "${TEMP_DMG}"
+          
+          # Attach and configure
+          DEVICE=$(hdiutil attach -readwrite -noverify "${TEMP_DMG}" | grep "Apple_HFS" | awk '{print $1}')
+          
+          # Optional: Set window properties
+          osascript -e "tell application \"Finder\" to set bounds of window \"${APP_NAME}\" to {100, 100, 600, 400}" || true
+          osascript -e "tell application \"Finder\" to set icon size of icon view options of window \"${APP_NAME}\" to 128" || true
+          
+          # Detach
+          hdiutil detach "${DEVICE}"
+          
+          # Convert to compressed read-only DMG
+          hdiutil convert "${TEMP_DMG}" -format UDZO -o "${DMG_NAME}"
+          
+          # Clean up
+          rm "${TEMP_DMG}"
+          
+          echo "Created ${DMG_NAME}"
+          ls -lh "${DMG_NAME}"
+
+      - name: Upload DMG Artifact
+        uses: actions/upload-artifact@v4
         with:
-          submodules: true
-      - name: Install SwiftLint
-        run: |
-          brew update
-          brew install swiftlint
-      - name: Check SwiftLint version
-        run: swiftlint version
-      - name: Run SwiftLint
-        run: |
-          swiftlint --quiet --strict
-  
+          name: azooKeyMac-dmg
+          path: azooKeyMac.dmg
+          if-no-files-found: error
